@@ -8,6 +8,7 @@ K-POP 코드 진행 기반 발매연도 예측 — 종합 대시보드
     2) pip install -r requirements.txt
     3) streamlit run app.py
 """
+import html
 from itertools import product
 from pathlib import Path
 
@@ -38,7 +39,7 @@ processed_dir = st.sidebar.text_input("processed 폴더 경로 (실험 결과 cs
 page = st.sidebar.radio(
     "페이지",
     ["개요", "사전지식 (음악 이론)", "EDA", "모델 성능 여정", "피처 중요도", "곡별 분석 (레트로/트렌디)", "가수·곡 검색",
-     "신곡 예측 체험", "비슷한 코드 진행 찾기"],
+     "신곡 예측 체험", "비슷한 코드 진행 찾기", "코드 패턴 검색"],
 )
 
 # ---- 코드 진행 유사도 비교용 상수/헬퍼 (머신러닝 예측과 무관, 순수 시퀀스 유사도) ----
@@ -149,14 +150,9 @@ def _chord_duration_sec_from_meta(section_meta, bpm):
     return (total_beats * 60.0 / bpm) / total_chords
 
 
-def _estimate_chord_duration_sec(n_raw_sections, total_chords, bpm):
-    """DB 곡용 추정치 — 원본 데이터에는 섹션별 2박/4박 여부가 별도 기록돼 있지 않으므로, 원본 섹션
-    하나 = 관례상 8마디(32비트, 4/4박자)라고 가정하고 beats/코드를 역산한다. 예: 한 섹션에 코드가
-    8개면 4비트/코드(4박 기준), 16개면 2비트/코드(2박 기준)로 자동 추정된다."""
-    if not bpm or not total_chords or not n_raw_sections:
-        return None
-    total_beats = 32.0 * n_raw_sections
-    return (total_beats * 60.0 / bpm) / total_chords
+# DB 원곡의 구간 라벨 셀(예: "chorus")이 노란색으로 채워져 있으면 그 구간은 2박 기준이라는 원본 엑셀의
+# 표시 규칙을 kpop_pipeline.parse_sheet가 그대로 읽어 sec["two_beat"]에 담아준다. 따라서 DB 곡도 입력
+# 곡과 똑같이 _chord_duration_sec_from_meta로 정확한 초/코드를 계산할 수 있다(추정치가 아니라 실측값).
 
 
 def _tempo_compat(dur_a, dur_b):
@@ -168,16 +164,17 @@ def _tempo_compat(dur_a, dur_b):
 
 @st.cache_data(show_spinner="곡별 파트별 코드 진행 프로필 계산 중...")
 def _compute_song_part_profiles(_modeling_df):
-    """모든 곡의 파트별(코러스/벌스/브릿지 등) TSD·도수 bigram 프로필 + 템포(초/코드) 추정치를 미리 계산."""
+    """모든 곡의 파트별(코러스/벌스/브릿지 등) TSD·도수 bigram 프로필 + 템포(초/코드, 실측 2박/4박 기준)를 미리 계산."""
     rows = []
     for r in _modeling_df.itertuples():
         part_acc = {}
         for sec in (r.sections or []):
-            bucket = part_acc.setdefault(sec["part"], {"degrees": [], "tsd": "", "n_raw_sections": 0, "n_chords": 0})
+            bucket = part_acc.setdefault(sec["part"], {"degrees": [], "tsd": "", "n_chords": 0, "section_meta": []})
             bucket["degrees"].extend(sec["degrees"])
             bucket["tsd"] += sec["tsd"]
-            bucket["n_raw_sections"] += 1
             bucket["n_chords"] += sec["n_chords"]
+            if sec["n_chords"] > 0:
+                bucket["section_meta"].append((sec["n_chords"], 2 if sec.get("two_beat") else 4))
         parts = {}
         for part, d in part_acc.items():
             if d["n_chords"] < 2:
@@ -185,13 +182,198 @@ def _compute_song_part_profiles(_modeling_df):
             parts[part] = {
                 "tsd_vec": _bigram_freq_vector(_clean_tsd_seq(d["tsd"]), TSD_BIGRAMS),
                 "deg_vec": _bigram_freq_vector(_degree_base_seq(d["degrees"]), DEG_BIGRAMS),
-                "chord_duration_sec": _estimate_chord_duration_sec(d["n_raw_sections"], d["n_chords"], r.tempo_bpm),
+                "chord_duration_sec": _chord_duration_sec_from_meta(d["section_meta"], r.tempo_bpm),
             }
         rows.append({
             "artist": r.artist, "title": r.title, "release_year": r.release_year,
             "generation": r.generation, "parts": parts,
         })
     return pd.DataFrame(rows)
+
+
+# ---- "SQL처럼" 정확한(또는 오차 허용) 패턴으로 곡을 필터링하는 코드 패턴 검색용 헬퍼 ----
+PART_OPTIONS_FOR_SEARCH = [
+    "chorus", "pre-chorus", "post-chorus", "intro-chorus", "verse",
+    "bridge", "rap", "build-up", "break-dance", "break-down", "intro", "outro",
+]
+
+
+def _best_window_match(seq, pattern):
+    """seq(문자열 또는 리스트) 안에서 pattern과 길이가 같은 구간 중 원소가 다른 개수(Hamming 거리)가
+    가장 작은 시작 위치를 찾는다. seq가 pattern보다 짧으면 None."""
+    n, m = len(seq), len(pattern)
+    if m == 0 or n < m:
+        return None
+    best_start, best_mismatch = None, m + 1
+    for start in range(n - m + 1):
+        mismatch = sum(1 for a, b in zip(seq[start:start + m], pattern) if a != b)
+        if mismatch < best_mismatch:
+            best_mismatch, best_start = mismatch, start
+            if mismatch == 0:
+                break
+    return (best_start, best_mismatch)
+
+
+def _downsample_two_beat(seq):
+    """2박 기준 시퀀스에서 각 마디의 다운비트(첫 코드)만 추출해 4박 기준으로 변환한다 —
+    0,2,4,...번째(0-인덱스, 사람이 세면 1,3,5,7번째) 원소만 취한다. 문자열/리스트 모두 동작."""
+    return seq[0::2]
+
+
+def _search_pattern_in_songs(_modeling_df, target_part, pattern_seq, max_mismatch, mode, pattern_two_beat):
+    """전체 곡의 원본 섹션(파트별로 나뉘기 전, 엑셀에 실제로 존재하는 구간 단위)을 순회하며 pattern_seq와
+    가장 비슷한 구간을 곡당 1개(가장 오차가 적은 것)만 찾는다. target_part=None이면 모든 파트 대상.
+    mode: 'tsd'(T/S/D 문자열) 또는 'degree'(조성 무관 스케일 디그리 문자 리스트).
+    pattern_two_beat: 입력 패턴이 2박 기준인지. 같은 박자 기준 구간은 그대로(직접) 비교하고("동일 박자"),
+    다른 박자 기준 구간은 2박 쪽을 다운샘플링(다운비트만 추출)해서 4박 기준으로 맞춘 뒤 비교한다("박자 변환").
+    두 그룹을 (동일 박자 결과, 박자 변환 결과)로 나눠서 반환 — 동일 박자 매칭을 우선적으로 보여주기 위함.
+    다운샘플링된 쪽에서는 실제 매칭 위치가 원본 배열에서 짝수 간격으로 떨어지므로, 하이라이트용으로
+    쓸 원본 인덱스 리스트(match_indices)를 직접 계산해서 반환한다(연속 구간이 아닐 수 있음)."""
+    same_res, cross_res = [], []
+    for r in _modeling_df.itertuples():
+        best_same, best_cross = None, None
+        for sec_idx, sec in enumerate(r.sections or []):
+            if sec["n_chords"] == 0:
+                continue
+            if target_part is not None and sec["part"] != target_part:
+                continue
+            raw_seq = sec["tsd"] if mode == "tsd" else [(base_degree(d) or "") for d in sec["degrees"]]
+            sec_two_beat = bool(sec.get("two_beat"))
+
+            if sec_two_beat == pattern_two_beat:
+                m = _best_window_match(raw_seq, pattern_seq)
+                if m is None:
+                    continue
+                start, mismatch = m
+                match_indices = list(range(start, start + len(pattern_seq)))
+            elif pattern_two_beat:
+                # 패턴(2박) -> 다운샘플링해서 4박 구간과 비교. 구간은 그대로라 연속 구간으로 하이라이트된다.
+                q_down = _downsample_two_beat(pattern_seq)
+                m = _best_window_match(raw_seq, q_down)
+                if m is None or not q_down:
+                    continue
+                start, mismatch = m
+                match_indices = list(range(start, start + len(q_down)))
+            else:
+                # 구간(2박) -> 다운샘플링해서 4박 패턴과 비교. 매칭 위치가 원본에서 짝수 간격으로 떨어진다.
+                s_down = _downsample_two_beat(raw_seq)
+                m = _best_window_match(s_down, pattern_seq)
+                if m is None:
+                    continue
+                start, mismatch = m
+                match_indices = [(start + k) * 2 for k in range(len(pattern_seq))]
+
+            if mismatch > max_mismatch:
+                continue
+            entry = (mismatch, sec_idx, match_indices)
+            if sec_two_beat == pattern_two_beat:
+                if best_same is None or mismatch < best_same[0]:
+                    best_same = entry
+            else:
+                if best_cross is None or mismatch < best_cross[0]:
+                    best_cross = entry
+
+        base = {
+            "artist": r.artist, "title": r.title, "release_year": r.release_year,
+            "generation": r.generation, "key": r.key, "tempo_bpm": r.tempo_bpm, "sections": r.sections,
+        }
+        if best_same is not None:
+            mismatch, sec_idx, match_indices = best_same
+            same_res.append({**base, "match_section_idx": sec_idx, "match_indices": match_indices,
+                              "mismatch": mismatch, "cross_resolution": False})
+        if best_cross is not None:
+            mismatch, sec_idx, match_indices = best_cross
+            cross_res.append({**base, "match_section_idx": sec_idx, "match_indices": match_indices,
+                               "mismatch": mismatch, "cross_resolution": True})
+
+    same_res.sort(key=lambda x: (x["mismatch"], x["release_year"]))
+    cross_res.sort(key=lambda x: (x["mismatch"], x["release_year"]))
+    return same_res, cross_res
+
+
+# T=초록(토닉/안정) · S=노랑(서브도미넌트) · D=빨강(도미넌트) — 기능화성 색상 코딩
+TSD_COLOR = {
+    "T": ("#D9F4E3", "#146C34"),
+    "S": ("#FFF3B0", "#8A6D00"),
+    "D": ("#FFD9D9", "#B3261E"),
+}
+# 패턴이 일치한 글자는 배경색 대신 진한 테두리(box-shadow)로 표시 — T/S/D 배경색과 겹치지 않게 하기 위함
+MATCH_RING = "box-shadow:0 0 0 2px #241B3D inset;font-weight:700;"
+
+
+def _beat_basis_label(two_beat):
+    """섹션 라벨 셀의 색(노란색=2박 기준)을 그대로 읽어온 실측값 — 원본 엑셀의 표시 규칙과 동일하다."""
+    return "2박 기준" if two_beat else "4박 기준"
+
+
+def _render_song_match_html(match):
+    """곡 하나의 전체 섹션(파트|코드|도수|T·S·D|박자 기준) 표를 HTML로 그린다. T/S/D는 기능별 색상으로
+    구분하고, 실제로 패턴이 일치한 구간은 테두리로 강조한다 — '가장 유사한 파트'를 숫자가 아니라
+    한눈에 보이는 표시로 보여주기 위함."""
+    sections = [s for s in (match["sections"] or []) if s["n_chords"] > 0]
+    match_idx = match["match_section_idx"]
+    match_indices = set(match["match_indices"])
+
+    def build_plain(tokens, joiner, is_match_row):
+        parts = []
+        for j, tok in enumerate(tokens):
+            esc = html.escape(str(tok)) if str(tok) else "-"
+            if is_match_row and j in match_indices:
+                parts.append(f"<span style='padding:0 2px;border-radius:2px;{MATCH_RING}'>{esc}</span>")
+            else:
+                parts.append(esc)
+        return joiner.join(parts)
+
+    def build_tsd(chars, is_match_row):
+        parts = []
+        for j, ch in enumerate(chars):
+            bg, fg = TSD_COLOR.get(ch, ("#EDEAF5", "#6B6580"))
+            style = f"background:{bg};color:{fg};padding:0 3px;border-radius:3px;"
+            if is_match_row and j in match_indices:
+                style += MATCH_RING
+            parts.append(f"<span style='{style}'>{html.escape(ch)}</span>")
+        return "".join(parts)
+
+    rows_html = []
+    for i, sec in enumerate(sections):
+        is_match_row = (i == match_idx)
+        chords_html = build_plain(sec["chords"], " ", is_match_row)
+        deg_html = build_plain(sec["degrees"], " ", is_match_row)
+        tsd_html = build_tsd(list(sec["tsd"]), is_match_row)
+        beat_label = _beat_basis_label(sec.get("two_beat"))
+        row_style = "background:#FFF7E6;" if is_match_row else ""
+        label_weight = "700" if is_match_row else "400"
+        rows_html.append(
+            f"<tr style='{row_style}'>"
+            f"<td style='padding:4px 8px;font-weight:{label_weight};white-space:nowrap;'>{html.escape(sec['raw_label'])}</td>"
+            f"<td style='padding:4px 8px;font-family:monospace;'>{chords_html}</td>"
+            f"<td style='padding:4px 8px;font-family:monospace;'>{deg_html}</td>"
+            f"<td style='padding:4px 8px;font-family:monospace;letter-spacing:2px;'>{tsd_html}</td>"
+            f"<td style='padding:4px 8px;color:#6B6580;white-space:nowrap;font-size:0.9em;'>{beat_label}</td>"
+            f"</tr>"
+        )
+
+    match_note = "완전일치" if match["mismatch"] == 0 else f"오차 {match['mismatch']}글자"
+    bpm_val = match.get("tempo_bpm")
+    bpm_disp = f"{int(round(bpm_val))} BPM" if bpm_val else "BPM 미상"
+    key_disp = html.escape(str(match.get("key") or "-"))
+    cross_badge = (
+        " <span style='background:#EDEAF5;color:#6C4AB6;padding:1px 6px;border-radius:3px;font-size:0.8em;'>"
+        "박자 변환됨</span>" if match.get("cross_resolution") else ""
+    )
+    return (
+        "<div style='border:1px solid #E5DFF2;border-radius:8px;padding:10px 14px;margin-bottom:14px;'>"
+        f"<div style='font-weight:700;margin-bottom:6px;'>{html.escape(match['artist'])} - {html.escape(match['title'])}"
+        f"<span style='color:#6B6580;font-weight:400;font-size:0.85em;'> "
+        f"({key_disp}, {bpm_disp}) · {match_note}</span>{cross_badge}</div>"
+        "<table style='width:100%;border-collapse:collapse;font-size:0.85em;'>"
+        "<tr style='color:#6B6580;text-align:left;border-bottom:1px solid #E5DFF2;'>"
+        "<th style='padding:4px 8px;'>파트</th><th style='padding:4px 8px;'>코드</th>"
+        "<th style='padding:4px 8px;'>도수</th><th style='padding:4px 8px;'>T/S/D</th>"
+        "<th style='padding:4px 8px;'>박자 기준</th></tr>"
+        f"{''.join(rows_html)}"
+        "</table></div>"
+    )
 
 
 def _resize_section_chords(sec, target_len, section_idx=None):
@@ -930,7 +1112,7 @@ elif page == "신곡 예측 체험":
                     st.dataframe(feat_display, hide_index=True, use_container_width=True)
 
 # ================================================================ 비슷한 코드 진행 찾기
-else:
+elif page == "비슷한 코드 진행 찾기":
     st.title("비슷한 코드 진행 찾기 — 매쉬업 후보 추천")
     st.caption("머신러닝 예측이 아니라 순수 유사도 검색입니다. 입력한 곡의 코드 진행을 도수(스케일 디그리)·기능화성(T/S/D) "
                "시퀀스로 바꾼 뒤, 같은 파트(예: chorus ↔ chorus)끼리만 데이터에 있는 293곡과 진행 패턴(bigram)이 얼마나 "
@@ -1034,8 +1216,9 @@ else:
     )
     tempo_weight = st.slider(
         "템포(BPM) 궁합 반영 비중", 0.0, 1.0, 0.3,
-        help="0이면 템포는 전혀 보지 않고 코드 진행만 비교합니다. 값을 올릴수록, 파트별 BPM·2박/4박 기준으로 추정한 "
-             "'코드가 바뀌는 체감 속도'가 비슷한 곡에 가산점을 더 크게 줍니다.",
+        help="0이면 템포는 전혀 보지 않고 코드 진행만 비교합니다. 값을 올릴수록, 파트별 BPM·2박/4박 기준(원본 엑셀의 "
+             "구간 라벨 셀 색으로 실제로 표시된 값)으로 계산한 '코드가 바뀌는 체감 속도'가 비슷한 곡에 가산점을 더 "
+             "크게 줍니다.",
         key="sim_tempo_weight",
     )
     sd_similarity = st.slider(
@@ -1137,3 +1320,104 @@ else:
                     with st.expander(f"1위 '{top_label}' 파트별 상세 비교 보기"):
                         detail_df = pd.DataFrame(detail_by_key[top_key])
                         st.dataframe(detail_df, hide_index=True, use_container_width=True)
+
+# ================================================================ 코드 패턴 검색
+else:
+    st.title("코드 패턴 검색 — SQL처럼 구조로 필터링")
+    st.caption("숫자 유사도 랭킹 대신, 원하는 파트에서 정확히(또는 오차 허용 범위 안에서) 이 T/S/D·도수 패턴을 가진 "
+               "곡을 그대로 찾아서, 그 곡의 전체 코드 구조(파트·코드·도수·T/S/D)와 함께 보여줍니다. 일치한 구간은 "
+               "테두리로 강조돼서, 숫자를 읽지 않아도 한눈에 어느 파트가 왜 매칭됐는지 알 수 있습니다.")
+    st.markdown(
+        "<span style='background:#D9F4E3;color:#146C34;padding:1px 6px;border-radius:3px;font-size:0.85em;'>T 토닉</span> "
+        "<span style='background:#FFF3B0;color:#8A6D00;padding:1px 6px;border-radius:3px;font-size:0.85em;'>S 서브도미넌트</span> "
+        "<span style='background:#FFD9D9;color:#B3261E;padding:1px 6px;border-radius:3px;font-size:0.85em;'>D 도미넌트</span> "
+        "<span style='color:#6B6580;font-size:0.85em;'>· 진한 테두리 = 실제로 패턴이 일치한 구간</span>",
+        unsafe_allow_html=True,
+    )
+    st.caption("'박자 기준' 열은 원본 엑셀에서 구간 라벨 셀(예: chorus)이 노란색으로 표시된 구간을 그대로 읽어온 "
+               "값입니다 (노란색=2박 기준, 기본색=4박 기준).")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        part_choice = st.selectbox(
+            "검색할 파트", ["(모든 파트)"] + PART_OPTIONS_FOR_SEARCH, key="pat_part",
+            help="예: 'chorus'를 고르면 모든 곡의 코러스 구간에서만 패턴을 찾습니다.",
+        )
+    with c2:
+        mode_choice = st.radio("패턴 종류", ["T/S/D 구조", "도수(스케일 디그리)"], horizontal=True, key="pat_mode")
+
+    pcol1, pcol2 = st.columns([3, 1])
+    with pcol1:
+        pattern_input = st.text_input(
+            "패턴 입력" + (" — 예: TTSD" if mode_choice == "T/S/D 구조" else " — 예: 1645 또는 1-6-4-5"),
+            key="pat_input",
+        )
+    with pcol2:
+        pattern_two_beat = st.checkbox(
+            "2박 기준으로 입력", key="pat_two_beat",
+            help="체크하면 이 패턴을 2박 기준(마디당 코드 2개)으로 해석합니다. 2박 기준 구간을 우선적으로 찾고, "
+                 "1·3·5·7번째(다운비트)만 추출해 4박 기준으로 변환한 뒤 4박 구간과도 비교합니다. 체크하지 않으면 "
+                 "반대로 4박 기준 구간을 우선 찾고, 2박 기준 구간은 다운비트만 추출해서 비교합니다.",
+        )
+    max_mismatch = st.slider(
+        "허용 오차 (문자 수)", 0, 3, 0, key="pat_tolerance",
+        help="0이면 SQL의 LIKE '%패턴%'처럼 정확히 일치하는 구간만 찾습니다. 1 이상이면 그만큼 문자가 달라도 "
+             "'거의 똑같은' 구간까지 포함합니다.",
+    )
+    n_show = st.slider("표시할 곡 수", 5, 50, 20, key="pat_nshow")
+    search_clicked = st.button("🔍 패턴 검색", type="primary", key="pat_search_btn")
+
+    if search_clicked:
+        raw = pattern_input.strip()
+        if not raw:
+            st.error("패턴을 입력하세요.")
+        else:
+            pattern_seq, mode = None, None
+            if mode_choice == "T/S/D 구조":
+                candidate = raw.upper().replace(" ", "").replace("-", "")
+                if not candidate or any(ch not in "TSD" for ch in candidate):
+                    st.error("T/S/D 패턴은 T, S, D 문자만 사용할 수 있습니다 (예: TTSD).")
+                else:
+                    pattern_seq, mode = candidate, "tsd"
+            else:
+                cleaned = raw.replace("-", "").replace(" ", "")
+                candidate = [base_degree(ch) for ch in cleaned]
+                if not cleaned or any(p is None for p in candidate):
+                    st.error("도수 패턴은 1~7 숫자만 사용할 수 있습니다 (예: 1645 또는 1-6-4-5).")
+                else:
+                    pattern_seq, mode = candidate, "degree"
+
+            if pattern_seq:
+                target_part = None if part_choice == "(모든 파트)" else part_choice
+                same_res, cross_res = _search_pattern_in_songs(
+                    modeling_df, target_part, pattern_seq, max_mismatch, mode, pattern_two_beat,
+                )
+                if not same_res and not cross_res:
+                    st.warning("일치하는 곡이 없습니다. 허용 오차를 늘리거나 파트를 '(모든 파트)'로 바꿔보세요.")
+                else:
+                    my_basis = "2박" if pattern_two_beat else "4박"
+                    other_basis = "4박" if pattern_two_beat else "2박"
+
+                    exact_count = sum(1 for r in same_res if r["mismatch"] == 0)
+                    st.success(f"{my_basis} 기준 그대로 일치하는 구간 {len(same_res)}곡(완전일치 {exact_count}곡), "
+                               f"{other_basis} 기준을 변환해서 찾은 구간 {len(cross_res)}곡을 찾았습니다.")
+
+                    st.markdown(f"#### 1) {my_basis} 기준 — 그대로 일치 ({len(same_res)}곡)")
+                    if not same_res:
+                        st.caption("같은 박자 기준으로는 일치하는 구간이 없습니다.")
+                    else:
+                        html_blocks = [_render_song_match_html(r) for r in same_res[:n_show]]
+                        st.markdown("".join(html_blocks), unsafe_allow_html=True)
+
+                    st.markdown(f"#### 2) {other_basis} 기준을 변환해서 비교 ({len(cross_res)}곡)")
+                    down_note = (
+                        "입력한 2박 패턴에서 다운비트(1·3·5·7…번째)만 추출해 4박 기준으로 줄인 뒤 4박 구간과 비교했습니다."
+                        if pattern_two_beat else
+                        "2박 기준 구간에서 다운비트(1·3·5·7…번째)만 추출해 4박 기준으로 줄인 뒤 입력한 패턴과 비교했습니다."
+                    )
+                    st.caption(down_note)
+                    if not cross_res:
+                        st.caption("박자를 변환해서 비교해도 일치하는 구간이 없습니다.")
+                    else:
+                        html_blocks = [_render_song_match_html(r) for r in cross_res[:n_show]]
+                        st.markdown("".join(html_blocks), unsafe_allow_html=True)

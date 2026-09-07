@@ -84,6 +84,21 @@ def normalize_part_label(raw_label):
         return "intro"
     return l
 
+
+# 구간 라벨 셀(예: "intro", "chorus")이 이 색으로 채워져 있으면 그 구간은 2박 기준(마디당 코드 2개)이라는
+# 원본 엑셀의 표시 규칙. data_only=True로 열어도 셀 채우기 색은 그대로 유지된다.
+TWO_BEAT_FILL_RGB = "FFFFFF00"
+
+
+def is_two_beat_label_cell(ws, title_row, col):
+    """구간 라벨 셀의 배경색으로 2박 기준 여부를 판정한다(노란색=2박 기준)."""
+    try:
+        cell = ws.cell(row=title_row, column=col)
+        rgb = cell.fill.fgColor.rgb if cell.fill and cell.fill.fgColor else None
+        return isinstance(rgb, str) and rgb.upper() == TWO_BEAT_FILL_RGB
+    except Exception:
+        return False
+
 MAJOR_LABEL = {
     (0, False): "1", (0, True): "1m", (1, False): "b2", (1, True): "b2m",
     (2, False): "2M", (2, True): "2", (3, False): "b3", (3, True): "b3m",
@@ -356,7 +371,7 @@ def parse_sheet(ws, sheet_name):
             sections_list.append({
                 "raw_label": raw_label, "part": normalize_part_label(raw_label),
                 "chords": sec_chords, "degrees": sec_degrees, "tsd": sec_tsd,
-                "n_chords": len(sec_chords),
+                "n_chords": len(sec_chords), "two_beat": is_two_beat_label_cell(ws, title_row, col),
             })
             if "bridge" in label_types:
                 bridge_chords |= chords_here
