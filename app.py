@@ -494,9 +494,22 @@ if page == "개요":
     st.subheader("세대·그룹별 분포")
     col1, col2 = st.columns(2)
     with col1:
-        fig = px.histogram(modeling_df, x="generation", color="gender_group", barmode="group",
-                            category_orders={"generation": ["3세대", "3.5세대", "4세대"]},
-                            title="세대 x 그룹별 곡 수")
+        # 3.5세대는 걸그룹/보이그룹 구분 없이 수집된 세대라 gender_group이 결측(NaN)이다.
+        # px.histogram은 color 컬럼이 NaN인 행을 통째로 그래프에서 빼버려서 3.5세대 막대가 아예
+        # 사라지는 문제가 있었다 — NaN을 별도 라벨로 채워서 막대가 보이게 한다.
+        gen_dist_df = modeling_df.copy()
+        gen_dist_df["gender_group_display"] = (
+            gen_dist_df["gender_group"].astype(object).fillna("성별 구분 없음(3.5세대)")
+        )
+        fig = px.histogram(
+            gen_dist_df, x="generation", color="gender_group_display", barmode="group",
+            category_orders={
+                "generation": ["3세대", "3.5세대", "4세대"],
+                "gender_group_display": ["걸그룹", "보이그룹", "성별 구분 없음(3.5세대)"],
+            },
+            title="세대 x 그룹별 곡 수",
+        )
+        fig.update_layout(legend_title_text="그룹")
         st.plotly_chart(fig, use_container_width=True)
     with col2:
         fig = px.histogram(modeling_df, x="release_year", title="발매연도별 곡 수", nbins=15)
