@@ -494,19 +494,34 @@ if page == "개요":
     st.subheader("세대·그룹별 분포")
     col1, col2 = st.columns(2)
     with col1:
-        # 3.5세대는 걸그룹/보이그룹 구분 없이 수집된 세대라 gender_group이 결측(NaN)이다.
-        # px.histogram은 color 컬럼이 NaN인 행을 통째로 그래프에서 빼버려서 3.5세대 막대가 아예
-        # 사라지는 문제가 있었다 — NaN을 별도 라벨로 채워서 막대가 보이게 한다.
+        # 2.5세대·3.5세대는 걸그룹/보이그룹 구분 없이 수집된 세대라 gender_group이 결측(NaN)이다.
+        # px.histogram은 color 컬럼이 NaN인 행을 통째로 그래프에서 빼버려서 막대가 아예 사라지는
+        # 문제가 있었다 — NaN을 "성별 구분 없음(해당 세대)"로 채워서 세대별로 정확히 구분되게 표시한다.
         gen_dist_df = modeling_df.copy()
-        gen_dist_df["gender_group_display"] = (
-            gen_dist_df["gender_group"].astype(object).fillna("성별 구분 없음(3.5세대)")
+        gen_dist_df["gender_group_display"] = np.where(
+            gen_dist_df["gender_group"].notna(),
+            gen_dist_df["gender_group"].astype(object),
+            "성별 구분 없음(" + gen_dist_df["generation"].astype(str) + ")",
         )
+
+        GEN_ORDER = ["2.5세대", "3세대", "3.5세대", "4세대"]
+        present_gens = [g for g in GEN_ORDER if g in gen_dist_df["generation"].astype(str).unique()]
+        extra_gens = [g for g in gen_dist_df["generation"].astype(str).unique() if g not in present_gens]
+        gen_order_final = present_gens + sorted(extra_gens)
+
+        nan_labels = sorted({
+            lbl for lbl in gen_dist_df["gender_group_display"].unique() if lbl not in ("걸그룹", "보이그룹")
+        })
+        color_map = {"걸그룹": "#378ADD", "보이그룹": "#F5A623"}
+        color_map.update({lbl: "#E6484B" for lbl in nan_labels})  # 성별 구분 없음 -> 빨간색으로 통일
+
         fig = px.histogram(
             gen_dist_df, x="generation", color="gender_group_display", barmode="group",
             category_orders={
-                "generation": ["3세대", "3.5세대", "4세대"],
-                "gender_group_display": ["걸그룹", "보이그룹", "성별 구분 없음(3.5세대)"],
+                "generation": gen_order_final,
+                "gender_group_display": ["걸그룹", "보이그룹"] + nan_labels,
             },
+            color_discrete_map=color_map,
             title="세대 x 그룹별 곡 수",
         )
         fig.update_layout(legend_title_text="그룹")
